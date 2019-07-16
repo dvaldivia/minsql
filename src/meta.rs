@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::process;
 use std::sync::{Arc, RwLock};
 
-use futures::future::Future;
+use futures::future;
+use futures::future::{Either, Future};
 use futures::stream;
 use futures::Stream;
 use log::{error, info};
@@ -29,6 +30,8 @@ use rusoto_s3::{GetObjectRequest, ListObjectsRequest, S3};
 
 use crate::config::{Config, DataStore, Log, LogAuth, Token};
 use crate::storage;
+use futures::sink::Sink;
+use tokio::sync::mpsc;
 
 pub struct Meta {
     config: Arc<RwLock<Config>>,
@@ -39,8 +42,81 @@ impl Meta {
         Meta { config: cfg }
     }
 
+    pub fn load_config_from_metabucket(&self) {
+        let test_cfg = Arc::clone(&self.config);
+
+        tokio::run(future::lazy(move || {
+            let test_cfg = Arc::clone(&test_cfg);
+            let (marker_tx, marker_rx) = mpsc::unbounded_channel::<Option<String>>();
+            let (files_tx, files_rx) = mpsc::unbounded_channel::<Vec<String>>();
+
+            tokio::spawn(futures::lazy(|| {
+                files_rx.map_err(|_| ()).for_each(|x| {
+                    println!("got it on the other side! {:?}", x.len());
+                    Ok(())
+                })
+            }));
+
+            let marker_tx2 = marker_tx.clone();
+            tokio::spawn(futures::lazy(|| {
+                marker_tx2
+                    .send(Some("".to_string()))
+                    .map_err(|_| ())
+                    .map(|_| ())
+            }));
+            let marker_tx3 = marker_tx.clone();
+            let files_tx2 = files_tx.clone();
+
+            marker_rx.map_err(|_| ()).for_each(move |marker| {
+                if marker.is_none() {
+                    Either::A(future::ok(()))
+                } else {
+                    let ds = ds_for_metabucket(Arc::clone(&test_cfg));
+                    let s3_client = storage::client_for_datastore(&ds);
+                    let marker_tx4 = marker_tx3.clone();
+                    let files_tx3 = files_tx2.clone();
+                    let task = s3_client
+                        .list_objects(ListObjectsRequest {
+                            bucket: ds.bucket.clone(),
+                            prefix: Some("minsql/meta/".to_owned()),
+                            marker: marker,
+                            ..Default::default()
+                        })
+                        .map(move |list_objects| {
+                            let mut files_tx4 = files_tx3.clone();
+
+                            let x = match list_objects.contents {
+                                Some(v) => v.iter().map(|x| x.key.clone().unwrap()).collect(),
+                                None => Vec::new(),
+                            };
+                            println!("DONE {}", &x.len());
+                            tokio::spawn(futures::lazy(move || {
+                                files_tx3.send(x).map_err(|_| ()).map(|_| ())
+                            }));
+
+                            let mut marker_tx5 = marker_tx4.clone();
+
+                            let list_marker = list_objects.next_marker.clone();
+                            if list_marker.is_none() {
+                                println!("DONE MARKING: {:?}", &list_marker);
+                                marker_tx5.close();
+                                files_tx4.close();
+                            } else {
+                                println!("marker: {:?}", &list_marker);
+                                tokio::spawn(futures::lazy(move || {
+                                    marker_tx5.send(list_marker).map_err(|_| ()).map(|_| ())
+                                }));
+                            }
+                        })
+                        .map_err(|_| ());
+                    Either::B(task)
+                }
+            })
+        }));
+    }
+
     /// Scans the metabucket for configuration files and loads them into the shared state `Config`
-    pub fn load_config_from_metabucket(&self) -> impl Future<Item = (), Error = ()> {
+    pub fn load_config_from_metabucket_old(&self) -> impl Future<Item = (), Error = ()> {
         // validate access to the metadata store
         let ds = ds_for_metabucket(Arc::clone(&self.config));
         match storage::can_reach_datastore(&ds) {
@@ -79,14 +155,13 @@ impl Meta {
                 ..Default::default()
             })
             .map(|list_objects| match list_objects.contents {
-                Some(v) => v,
+                Some(v) => v.iter().map(|x| x.key.clone().unwrap()).collect(),
                 None => Vec::new(),
             })
             .map_err(|_| ())
             .and_then(|objects| {
                 // For each objects, get_object, filter out system files
                 stream::iter_ok(objects)
-                    .map(|file_object| file_object.clone().key.unwrap())
                     .map(move |file_key| {
                         let file_key_clone = file_key.clone();
                         s3_client2

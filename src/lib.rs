@@ -23,17 +23,21 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::config::Config;
-use crate::ingest::{Ingest, IngestBuffer};
-use crate::meta::Meta;
+use futures::sink::Sink;
 use futures::{future, Future, Stream};
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
 use hyper::Server;
 use log::{error, info};
 use native_tls::{Identity, TlsAcceptor};
+use rusoto_s3::{GetObjectRequest, ListObjectsRequest, S3};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::timer::Interval;
+
+use crate::config::Config;
+use crate::ingest::{Ingest, IngestBuffer};
+use crate::meta::{ds_for_metabucket, Meta};
 
 mod api;
 mod auth;
@@ -80,12 +84,9 @@ impl MinSQL {
         let cfg_valid_ds = Arc::clone(&self.config);
         self.validate_datastore_reachability(cfg_valid_ds);
 
-        let meta_cfg = Arc::clone(&self.config);
-        // initial load of configuraiton
-        tokio::run(future::lazy(|| {
-            let meta_c = Meta::new(meta_cfg);
-            meta_c.load_config_from_metabucket()
-        }));
+        let meta_c = Meta::new(Arc::clone(&self.config));
+        meta_c.load_config_from_metabucket();
+        println!("woot");
 
         let read_cfg = self.config.read().unwrap();
         let pkcs12_cert = read_cfg.server.pkcs12_cert.clone();
